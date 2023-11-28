@@ -227,12 +227,19 @@ class DQN(nn.Module):
         in_channels = self.input_shape[0]  # Assuming input_shape is (channels, height, width)
         for layer_name, layer_params in self.config['model'].items():
             if 'Conv2D' in layer_name:
+                # Calculate padding for 'same' padding
+                if layer_params.get('padding') == 'same':
+                    kernel_size = layer_params['kernel_size']
+                    padding = [(k - 1) // 2 for k in kernel_size]  # This calculation ensures 'same' padding
+                else:
+                    padding = 0
+
                 layers.append(
                     nn.Conv2d(
                         in_channels, 
                         layer_params['filters'], 
                         kernel_size=tuple(layer_params['kernel_size']), 
-                        padding='same' if 'padding' in layer_params else 0
+                        padding=padding
                     )
                 )
                 layers.append(nn.ReLU())
@@ -280,9 +287,7 @@ class DeepQLearningAgent(Agent):
 
         # Set up the optimizer - you can customize the learning rate and other parameters as needed
         self._optimizer = optim.RMSprop(self._model.parameters(), lr=0.0005)
-
-        # Define the loss function - using SmoothL1Loss (Huber Loss)
-        self._loss_fn = nn.SmoothL1Loss()
+        self._criterion = nn.HuberLoss(reduction="mean")
 
     def reset_models(self):
         """ Reset all the models by creating new graphs"""
@@ -300,7 +305,6 @@ class DeepQLearningAgent(Agent):
         board = board.permute(0, 3, 1, 2)  # Change to [batch_size, channels, height, width]
         return board
 
-
     def _get_model_outputs(self, board, model=None):
         if isinstance(board, np.ndarray):
             board = torch.tensor(board, dtype=torch.float32, device=self.device)
@@ -309,6 +313,9 @@ class DeepQLearningAgent(Agent):
 
         if model is None:
             model = self._model
+
+        model.eval()
+
         with torch.no_grad():
             model_outputs = model(board)
         return model_outputs.cpu().numpy()
@@ -331,27 +338,28 @@ class DeepQLearningAgent(Agent):
         return board.astype(np.float32)/4.0
 
     def move(self, board, legal_moves, value=None):
-        # Get model outputs for the given board
+        """Get the action with maximum Q value using PyTorch
+
+        Parameters
+        ----------
+        board : Numpy array
+            The board state on which to calculate the best action.
+        legal_moves : Numpy array
+            Array indicating legal moves.
+        value : None, optional
+            Not used, but kept for compatibility with interface.
+
+        Returns
+        -------
+        output : Numpy array
+            Selected action using the argmax function.
+        """
+        # Get Q values from the model for the given board
         model_outputs = self._get_model_outputs(board, self._model)
 
-        # Convert model_outputs to a PyTorch tensor if it's a numpy array
-        if isinstance(model_outputs, np.ndarray):
-            model_outputs = torch.tensor(model_outputs, dtype=torch.float32, device=self.device)
+        # Mask out illegal actions and select the best action
+        return np.argmax(np.where(legal_moves == 1, model_outputs, -np.inf), axis=1)
 
-        # Ensure legal_moves is also a tensor and on the same device
-        if isinstance(legal_moves, np.ndarray):
-            legal_moves = torch.tensor(legal_moves, dtype=torch.bool, device=self.device)
-
-        # Apply the legal moves mask to the model outputs
-        # Using torch.where to filter out illegal actions by setting them to -inf
-        legal_model_outputs = torch.where(legal_moves, model_outputs, torch.tensor(-np.inf, device=self.device))
-
-        # Choose the action with the highest Q-value among the legal actions
-        selected_action = torch.argmax(legal_model_outputs, dim=1)
-        print(f"Selected action: {selected_action}, Q-values: {model_outputs}")
-
-        return selected_action.cpu().numpy()  
-    
     def get_action_proba(self, board, values=None):
         """Returns the action probability values using the DQN model"""
         board_tensor = self._prepare_input(board)  # Convert Numpy array to PyTorch tensor
@@ -386,17 +394,23 @@ class DeepQLearningAgent(Agent):
 
     def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
         # Sample data from the buffer
-        states, actions, rewards, next_states, dones, _ = self._buffer.sample(batch_size)
+        states, actions, rewards, next_states, dones, legal_moves = self._buffer.sample(batch_size)
+
+        print(f"Shapes after sampling: states {states.shape}, actions {actions.shape}, rewards {rewards.shape}, next_states {next_states.shape}, dones {dones.shape}, legal_moves {legal_moves.shape}")
 
         # Normalize and preprocess states and next_states
         states = self._normalize_board(states)
         states = self._prepare_input(states)
+        next_states = self._normalize_board(next_states)
         next_states = self._prepare_input(next_states)
-
+        
         # Convert actions, rewards, and dones to tensors
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)  # Convert rewards to a tensor here
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        
+        if reward_clip:
+            rewards = torch.sign(rewards)
 
         # Forward pass for current states
         q_values = self._model(states)
@@ -406,31 +420,39 @@ class DeepQLearningAgent(Agent):
 
         actions = actions.unsqueeze(-1)
 
+        # Print statements for debugging
+        print(f"Q-values shape: {q_values.shape}, Actions shape: {actions.shape}")
+
+        # Use target network for next state Q-values
+        self._target_net.eval()  # Switch to evaluation mode
+        with torch.no_grad():
+            next_q_values = self._target_net(next_states)
+            next_q_values[~torch.tensor(legal_moves, dtype=torch.bool, device=self.device)] = float('-inf')
+            next_q_values_max = next_q_values.max(1)[0]
+
+        self._model.train()  # Switch back to training mode
+
+        # Calculate expected Q values for the selected actions
+        expected_q_values = rewards + self._gamma * next_q_values_max * (1 - dones)
+        expected_q_values = expected_q_values.detach()  # Detach from graph
+
         # Gather the Q values corresponding to the selected actions
         selected_q_values = q_values.gather(1, actions).squeeze(-1)
 
-        if self._use_target_net:
-            next_q_values = self._target_net(next_states).max(1)[0]
-        else:
-            next_q_values = self._model(next_states).max(1)[0]
+        # Print shapes before loss calculation
+        print(f"Expected Q-values shape: {expected_q_values.shape}, Selected Q-values shape: {selected_q_values.shape}")
 
-        rewards = rewards.squeeze()
-        dones = dones.squeeze()
-
-        expected_q_values = rewards + self._gamma * next_q_values * (1 - dones)
-        selected_q_values = selected_q_values.squeeze()
-        expected_q_values = expected_q_values.squeeze()
-
-        # Compute loss
-        loss = self._loss_fn(selected_q_values, expected_q_values)
+        # Compute loss using only the selected actions
+        loss = self._criterion(selected_q_values, expected_q_values)
 
         # Backward pass and optimization
         self._optimizer.zero_grad()
         loss.backward()
         self._optimizer.step()
-        print(f"Training loss: {loss.item()}")
 
+        print(f"Loss: {loss.item()}")
         return loss.item()
+
 
     def update_target_net(self):
         if self._use_target_net:
