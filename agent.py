@@ -396,8 +396,6 @@ class DeepQLearningAgent(Agent):
         # Sample data from the buffer
         states, actions, rewards, next_states, dones, legal_moves = self._buffer.sample(batch_size)
 
-        print(f"Shapes after sampling: states {states.shape}, actions {actions.shape}, rewards {rewards.shape}, next_states {next_states.shape}, dones {dones.shape}, legal_moves {legal_moves.shape}")
-
         # Normalize and preprocess states and next_states
         states = self._normalize_board(states)
         states = self._prepare_input(states)
@@ -408,7 +406,7 @@ class DeepQLearningAgent(Agent):
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)  # Convert rewards to a tensor here
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
-        
+
         if reward_clip:
             rewards = torch.sign(rewards)
 
@@ -419,9 +417,8 @@ class DeepQLearningAgent(Agent):
             actions = actions.argmax(dim=1)
 
         actions = actions.unsqueeze(-1)
-
-        # Print statements for debugging
-        print(f"Q-values shape: {q_values.shape}, Actions shape: {actions.shape}")
+        rewards = rewards.squeeze()
+        dones = dones.squeeze()
 
         # Use target network for next state Q-values
         self._target_net.eval()  # Switch to evaluation mode
@@ -439,9 +436,6 @@ class DeepQLearningAgent(Agent):
         # Gather the Q values corresponding to the selected actions
         selected_q_values = q_values.gather(1, actions).squeeze(-1)
 
-        # Print shapes before loss calculation
-        print(f"Expected Q-values shape: {expected_q_values.shape}, Selected Q-values shape: {selected_q_values.shape}")
-
         # Compute loss using only the selected actions
         loss = self._criterion(selected_q_values, expected_q_values)
 
@@ -452,7 +446,6 @@ class DeepQLearningAgent(Agent):
 
         print(f"Loss: {loss.item()}")
         return loss.item()
-
 
     def update_target_net(self):
         if self._use_target_net:
