@@ -312,9 +312,6 @@ class DeepQLearningAgent(Agent):
         if model is None:
             model = self._model
 
-        # Set the model to evaluation mode (affects layers like dropout, batchnorm etc.)
-        model.eval()  
-
         # Convert the board to a PyTorch tensor, reshape it to match the model's expected input format
         reshaped_board = torch.from_numpy(board).float().reshape(-1, 2, 10, 10).to(self.device)
 
@@ -381,7 +378,7 @@ class DeepQLearningAgent(Agent):
         elif self._use_target_net:
             raise FileNotFoundError(f"Target model file not found: {target_model_path}")
 
-    def train_agent(self, batch_size=32, reward_clip=False):
+    def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
         # Sample a batch of experiences from the replay buffer
         states, actions, rewards, next_states, dones, legal_moves = self._buffer.sample(batch_size)
 
@@ -404,9 +401,6 @@ class DeepQLearningAgent(Agent):
 
         # Update target values based on the actions taken
         updated_targets = (1 - actions) * current_predictions + actions * discounted_future_rewards
-
-        # Set the model to training mode
-        self._model.train()
 
         # Zero out gradients from previous steps
         self._model.zero_grad()
