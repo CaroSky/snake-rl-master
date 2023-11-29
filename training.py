@@ -33,7 +33,7 @@ with open('model_config/{:s}.json'.format(version), 'r') as f:
     buffer_size = m['buffer_size']
 
 # define no of episodes, logging frequency
-episodes = 1 * (10**5)
+episodes = 6 * (10**5)
 log_frequency = 500
 games_eval = 8
 
