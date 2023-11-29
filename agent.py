@@ -211,161 +211,123 @@ class Agent():
             point value corresponding to the row and col values
         """
         return row*self._board_size + col
-    
+
 class DQN(nn.Module):
-    def __init__(self, config, input_shape, n_actions):
+    def __init__(self, version, input_shape, n_actions):
         super(DQN, self).__init__()
-        self.input_shape = input_shape
-        self.n_actions = n_actions
-        self.config = config
+
+        with open(f'model_config/{version}.json', 'r') as f:
+            model_config = json.load(f)
+
+        modules = []
+        in_channels = input_shape[2]
+        board_size = input_shape[0]
         
-        self.conv_layers = self._build_conv_layers()
-        self.fc_layers = self._build_fc_layers()
+        for layer in model_config['model']:
+            l = model_config['model'][layer]
 
-    def _build_conv_layers(self):
-        layers = []
-        in_channels = self.input_shape[0]  # Assuming input_shape is (channels, height, width)
-        for layer_name, layer_params in self.config['model'].items():
-            if 'Conv2D' in layer_name:
-                # Calculate padding for 'same' padding
-                if layer_params.get('padding') == 'same':
-                    kernel_size = layer_params['kernel_size']
-                    padding = [(k - 1) // 2 for k in kernel_size]  # This calculation ensures 'same' padding
-                else:
-                    padding = 0
+            if 'Conv2D' in layer:
+                out_channels = l['filters']
+                kernel_size = tuple(l['kernel_size'])
+                modules.append(nn.Conv2d(in_channels, out_channels, kernel_size))
+                if l['activation'] == 'relu':
+                    modules.append(nn.ReLU())
+                in_channels = out_channels
+                board_size = board_size - kernel_size[0] + 1
 
-                layers.append(
-                    nn.Conv2d(
-                        in_channels, 
-                        layer_params['filters'], 
-                        kernel_size=tuple(layer_params['kernel_size']), 
-                        padding=padding
-                    )
-                )
-                layers.append(nn.ReLU())
-                in_channels = layer_params['filters']
-        return nn.Sequential(*layers)
+            elif 'Flatten' in layer:
+                modules.append(nn.Flatten())
+                in_channels = in_channels * board_size * board_size
 
-    def _build_fc_layers(self):
-        layers = []
-        fc_input_features = self._calculate_conv_output_shape()
-        for layer_name, layer_params in self.config['model'].items():
-            if 'Dense' in layer_name:
-                layers.append(nn.Linear(fc_input_features, layer_params['units']))
-                layers.append(nn.ReLU())
-                fc_input_features = layer_params['units']
-        layers.append(nn.Linear(fc_input_features, self.n_actions))  # Final layer for action values
-        return nn.Sequential(*layers)
+            elif 'Dense' in layer:
+                modules.append(nn.Linear(in_channels, l['units']))
+                if l['activation'] == 'relu':
+                    modules.append(nn.ReLU())
+                in_channels = l['units']
 
-    def _calculate_conv_output_shape(self):
-        with torch.no_grad():
-            return self.conv_layers(torch.zeros(1, *self.input_shape)).view(1, -1).size(1)
+        self.conv = nn.Sequential(*modules)
+        self.out = nn.Linear(in_channels, n_actions)
 
     def forward(self, x):
-        x = self.conv_layers(x)
-        x = x.reshape(x.size(0), -1)  # Flatten
-        x = self.fc_layers(x)
-        return x
+        x = self.conv(x)
+        output = self.out(x)
+        return output
 
 class DeepQLearningAgent(Agent):
-    def __init__(self, board_size=10, frames=4, buffer_size=10000, gamma=0.99, n_actions=3, use_target_net=True, version=''):
-        super(DeepQLearningAgent, self).__init__(board_size=board_size, frames=frames, buffer_size=buffer_size, gamma=gamma, n_actions=n_actions, use_target_net=use_target_net, version=version)
 
-        # Load model configuration from JSON file
-        with open(f'model_config/{version}.json', 'r') as f:
-            self.config = json.loads(f.read())
+    def __init__(self, board_size=10, frames=4, buffer_size=10000, gamma=0.99, n_actions=3, use_target_net=True, version=''):
+        Agent.__init__(self,board_size=board_size, frames=frames, buffer_size=buffer_size, gamma=gamma, n_actions=n_actions, use_target_net=use_target_net, version=version)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        input_shape = (self._n_frames, self._board_size, self._board_size)
-        self._model = DQN(self.config, input_shape, n_actions).to(self.device)
-        if self._use_target_net:
-            self._target_net = DQN(self.config, input_shape, n_actions).to(self.device)
-        else:
-            self._target_net = None
+        self.reset_models()
 
-        # Set up the optimizer - you can customize the learning rate and other parameters as needed
         self._optimizer = optim.RMSprop(self._model.parameters(), lr=0.0005)
-        self._criterion = nn.HuberLoss(reduction="mean")
+        self._criterion = nn.SmoothL1Loss()
 
     def reset_models(self):
+
         """ Reset all the models by creating new graphs"""
-        self._model = self._agent_model()
+        self._model = self._agent_model().to(self.device)
         if(self._use_target_net):
-            self._target_net = self._agent_model()
+            self._target_net = self._agent_model().to(self.device)
             self.update_target_net()
 
     def _prepare_input(self, board):
-        if isinstance(board, np.ndarray):
-            board = torch.tensor(board, dtype=torch.float32, device=self.device)
-        board = board / 4.0  # Normalize
-        if board.ndim == 3:
-            board = board.unsqueeze(0)  # Add batch dimension
-        board = board.permute(0, 3, 1, 2)  # Change to [batch_size, channels, height, width]
-        return board
+
+        if(board.ndim == 3):
+            board = board.reshape((1,) + self._input_shape)
+        board = self._normalize_board(board.copy())
+        return board.copy()
 
     def _get_model_outputs(self, board, model=None):
-        if isinstance(board, np.ndarray):
-            board = torch.tensor(board, dtype=torch.float32, device=self.device)
-        
+
         board = self._prepare_input(board)
 
         if model is None:
             model = self._model
 
-        model.eval()
+        model.eval()  
+
+        reshaped_board = torch.from_numpy(board).float().reshape(-1, 2, 10, 10).to(self.device)
 
         with torch.no_grad():
-            model_outputs = model(board)
+            model_outputs = model(reshaped_board)
+
         return model_outputs.cpu().numpy()
 
-    def _normalize_board(self, board):
-        """Normalize the board before input to the network
-        
-        Parameters
-        ----------
-        board : Numpy array
-            The board state to normalize
 
-        Returns
-        -------
-        board : Numpy array
-            The copy of board state after normalization
-        """
-        # return board.copy()
-        # return((board/128.0 - 1).copy())
+    def _normalize_board(self, board):
+
         return board.astype(np.float32)/4.0
 
     def move(self, board, legal_moves, value=None):
-        """Get the action with maximum Q value using PyTorch
 
-        Parameters
-        ----------
-        board : Numpy array
-            The board state on which to calculate the best action.
-        legal_moves : Numpy array
-            Array indicating legal moves.
-        value : None, optional
-            Not used, but kept for compatibility with interface.
-
-        Returns
-        -------
-        output : Numpy array
-            Selected action using the argmax function.
-        """
-        # Get Q values from the model for the given board
         model_outputs = self._get_model_outputs(board, self._model)
 
-        # Mask out illegal actions and select the best action
         return np.argmax(np.where(legal_moves == 1, model_outputs, -np.inf), axis=1)
+    
+    def _agent_model(self):
+
+        model = DQN(self._version, (self._input_shape), self._n_actions)
+
+        return model
 
     def get_action_proba(self, board, values=None):
-        """Returns the action probability values using the DQN model"""
-        board_tensor = self._prepare_input(board)  # Convert Numpy array to PyTorch tensor
-        with torch.no_grad():
-            model_outputs_tensor = self._model(board_tensor)  # Forward pass through the model
-        return model_outputs_tensor.numpy()  # Convert back to Numpy array
+
+        model_outputs = self._get_model_outputs(board, self._model)
+        model_outputs = np.clip(model_outputs, -10, 10)  # Clip values for stability
+    
+        # Subtract max for numerical stability before softmax
+        model_outputs -= model_outputs.max(axis=1, keepdims=True)
+    
+        # Apply softmax
+        exp_outputs = np.exp(model_outputs)
+        probabilities = exp_outputs / exp_outputs.sum(axis=1, keepdims=True)
+    
+        return probabilities
+
     
     def save_model(self, file_path='', iteration=None):
         """Save the current models to disk using PyTorch's functionality"""
@@ -393,84 +355,56 @@ class DeepQLearningAgent(Agent):
             raise FileNotFoundError(f"Target model file not found: {target_model_path}")
 
     def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
-        # Sample data from the buffer
-        states, actions, rewards, next_states, dones, legal_moves = self._buffer.sample(batch_size)
+        s, a, r, next_s, done, legal_moves = self._buffer.sample(batch_size)
 
-        # Normalize and preprocess states and next_states
-        states = self._normalize_board(states)
-        states = self._prepare_input(states)
-        next_states = self._normalize_board(next_states)
-        next_states = self._prepare_input(next_states)
-        
-        # Convert actions, rewards, and dones to tensors
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)  # Convert rewards to a tensor here
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        if(reward_clip):
+            r = np.sign(r)
 
-        if reward_clip:
-            rewards = torch.sign(rewards)
+        current_model = self._target_net if self._use_target_net else self._model
+        next_model_outputs = self._get_model_outputs(next_s, current_model)
 
-        # Forward pass for current states
-        q_values = self._model(states)
+        discounted_reward = r + \
+            (self._gamma * np.max(np.where(legal_moves==1, next_model_outputs, -10000), axis = 1)\
+                                  .reshape(-1, 1)) * (1-done)
 
-        if actions.shape[1] == self._n_actions:
-            actions = actions.argmax(dim=1)
+        target = self._get_model_outputs(s)
 
-        actions = actions.unsqueeze(-1)
-        rewards = rewards.squeeze()
-        dones = dones.squeeze()
+        target = (1-a)*target + a*discounted_reward
 
-        # Use target network for next state Q-values
-        self._target_net.eval()  # Switch to evaluation mode
-        with torch.no_grad():
-            next_q_values = self._target_net(next_states)
-            next_q_values[~torch.tensor(legal_moves, dtype=torch.bool, device=self.device)] = float('-inf')
-            next_q_values_max = next_q_values.max(1)[0]
+        self._model.train(True)
 
-        self._model.train()  # Switch back to training mode
+        self._model.zero_grad()
 
-        # Calculate expected Q values for the selected actions
-        expected_q_values = rewards + self._gamma * next_q_values_max * (1 - dones)
-        expected_q_values = expected_q_values.detach()  # Detach from graph
+        reshaped_board = torch.tensor(self._normalize_board(s), requires_grad=True).float().reshape(-1, 2, 10, 10).to(self.device)
+        outputs = self._model(reshaped_board)
 
-        # Gather the Q values corresponding to the selected actions
-        selected_q_values = q_values.gather(1, actions).squeeze(-1)
+        target_tensor = torch.tensor(target, requires_grad=False).to(torch.float32).to(self.device)
 
-        # Compute loss using only the selected actions
-        loss = self._criterion(selected_q_values, expected_q_values)
-
-        # Backward pass and optimization
-        self._optimizer.zero_grad()
+        loss = self._criterion(outputs, target_tensor)
         loss.backward()
         self._optimizer.step()
 
-        print(f"Loss: {loss.item()}")
-        return loss.item()
+        return loss.detach().cpu().numpy()
 
     def update_target_net(self):
         if self._use_target_net:
             self._target_net.load_state_dict(self._model.state_dict())
 
     def compare_weights(self):
-        """Utility function to check if the model and target network have the same weights."""
-        if not self._use_target_net:
-            print("Target network not in use.")
-            return
-
-        for (layer_main, param_main), (layer_target, param_target) in zip(self._model.state_dict().items(), self._target_net.state_dict().items()):
-            if torch.equal(param_main, param_target):
-                print(f"{layer_main} weights are the same.")
-            else:
-                print(f"{layer_main} weights are different.")
+        for i, (layer_model, layer_target) in enumerate(zip(self._model.parameters(), self._target_net.parameters())):
+            c = (layer_model.data.numpy() == layer_target.data.numpy()).all()
+            print(layer_model)
+            print('Layer {:d} Weights Match: {:s}'.format(i, str(c)))
 
 
     def copy_weights_from_agent(self, agent_for_copy):
-        """Copy weights from another agent's model to this agent's model."""
-        assert isinstance(agent_for_copy, DeepQLearningAgent), "Agent type is required for copy"
-    
+        """Update weights between competing agents which can be used
+        in parallel training
+        """
+        assert isinstance(agent_for_copy, self), "Agent type is required for copy"
+
         self._model.load_state_dict(agent_for_copy._model.state_dict())
-        if self._use_target_net and agent_for_copy._use_target_net:
-            self._target_net.load_state_dict(agent_for_copy._target_net.state_dict())
+        self._target_net.load_state_dict(agent_for_copy._model_pred.state_dict())
 
 class PolicyGradientAgent(DeepQLearningAgent):
     """This agent learns via Policy Gradient method
