@@ -216,42 +216,61 @@ class DQN(nn.Module):
     def __init__(self, version, input_shape, n_actions):
         super(DQN, self).__init__()
 
+        # Load the model configuration from the JSON file
         with open(f'model_config/{version}.json', 'r') as f:
             model_config = json.load(f)
 
+        # Initialize a list to hold the layers of the neural network
         modules = []
-        in_channels = input_shape[2]
-        board_size = input_shape[0]
-        
+        in_channels = input_shape[2]  # Number of input channels is the same as frames
+        board_size = input_shape[0]   # Size of one dimension of the input since it is a square input
+
+        # Iterate through the layers defined in the model configuration
         for layer in model_config['model']:
             l = model_config['model'][layer]
 
             if 'Conv2D' in layer:
-                out_channels = l['filters']
-                kernel_size = tuple(l['kernel_size'])
+                out_channels = l['filters']  # Number of filters in the convolutional layer
+                kernel_size = tuple(l['kernel_size'])  # Size of the kernel in the convolutional layer
+                # Add a Conv2D layer to the modules list
                 modules.append(nn.Conv2d(in_channels, out_channels, kernel_size))
+                # If ReLU activation is specified, add a ReLU layer
                 if l['activation'] == 'relu':
                     modules.append(nn.ReLU())
+                # Update in_channels for the next layer
                 in_channels = out_channels
+                # Update board size based on the kernel size
                 board_size = board_size - kernel_size[0] + 1
 
+            # If the layer is a Flatten layer
             elif 'Flatten' in layer:
+                # Add a Flatten layer to the modules list
                 modules.append(nn.Flatten())
+                # Update in_channels for the next layer after flattening
                 in_channels = in_channels * board_size * board_size
 
+            # If the layer is a Dense (fully connected) layer
             elif 'Dense' in layer:
+                # Add a Linear layer to the modules list
                 modules.append(nn.Linear(in_channels, l['units']))
+                # If ReLU activation is specified, add a ReLU layer
                 if l['activation'] == 'relu':
                     modules.append(nn.ReLU())
+                # Update in_channels for the next layer
                 in_channels = l['units']
 
+        # Combine all the modules into a Sequential model for the convolutional part
         self.conv = nn.Sequential(*modules)
+        # Define the output layer as a Linear layer
         self.out = nn.Linear(in_channels, n_actions)
 
     def forward(self, x):
+        # Pass the input through the convolutional part of the network
         x = self.conv(x)
+        # Pass the result through the output layer to get the final output
         output = self.out(x)
         return output
+
 
 class DeepQLearningAgent(Agent):
 
@@ -261,9 +280,13 @@ class DeepQLearningAgent(Agent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
+        # Initialize or reset the models (main model and target model if used)
         self.reset_models()
 
+        # Define the optimizer for updating model parameters, here using RMSprop
         self._optimizer = optim.RMSprop(self._model.parameters(), lr=0.0005)
+
+        # Define the loss function, here using Smooth L1 Loss which is also known as Huber Loss, which was used in the original tf code
         self._criterion = nn.SmoothL1Loss()
 
     def reset_models(self):
@@ -282,21 +305,26 @@ class DeepQLearningAgent(Agent):
         return board.copy()
 
     def _get_model_outputs(self, board, model=None):
-
+        # Prepare the input board by normalizing and reshaping it
         board = self._prepare_input(board)
 
+        # Use the provided model if given, otherwise default to the agent's current model
         if model is None:
             model = self._model
 
+        # Set the model to evaluation mode (affects layers like dropout, batchnorm etc.)
         model.eval()  
 
+        # Convert the board to a PyTorch tensor, reshape it to match the model's expected input format
         reshaped_board = torch.from_numpy(board).float().reshape(-1, 2, 10, 10).to(self.device)
 
+        # Disable gradient calculations for performance improvement during inference
         with torch.no_grad():
+            # Pass the reshaped board through the model to get the output predictions
             model_outputs = model(reshaped_board)
 
+        # Convert the model outputs to a numpy array and return
         return model_outputs.cpu().numpy()
-
 
     def _normalize_board(self, board):
 
@@ -327,7 +355,6 @@ class DeepQLearningAgent(Agent):
         probabilities = exp_outputs / exp_outputs.sum(axis=1, keepdims=True)
     
         return probabilities
-
     
     def save_model(self, file_path='', iteration=None):
         """Save the current models to disk using PyTorch's functionality"""
@@ -354,36 +381,52 @@ class DeepQLearningAgent(Agent):
         elif self._use_target_net:
             raise FileNotFoundError(f"Target model file not found: {target_model_path}")
 
-    def train_agent(self, batch_size=32, num_games=1, reward_clip=False):
-        s, a, r, next_s, done, legal_moves = self._buffer.sample(batch_size)
+    def train_agent(self, batch_size=32, reward_clip=False):
+        # Sample a batch of experiences from the replay buffer
+        states, actions, rewards, next_states, dones, legal_moves = self._buffer.sample(batch_size)
 
-        if(reward_clip):
-            r = np.sign(r)
+        # Optionally clip rewards to -1, 0, or 1 to reduce variance
+        if reward_clip:
+            rewards = np.sign(rewards)
 
-        current_model = self._target_net if self._use_target_net else self._model
-        next_model_outputs = self._get_model_outputs(next_s, current_model)
+        # Choose the appropriate model (target network or regular model) for prediction
+        model_to_use = self._target_net if self._use_target_net else self._model
+        # Get predicted future rewards for the next states
+        future_rewards = self._get_model_outputs(next_states, model_to_use)
 
-        discounted_reward = r + \
-            (self._gamma * np.max(np.where(legal_moves==1, next_model_outputs, -10000), axis = 1)\
-                                  .reshape(-1, 1)) * (1-done)
+        # Calculate discounted future rewards; factor in whether the state was terminal (done)
+        discounted_future_rewards = rewards + \
+            (self._gamma * np.max(np.where(legal_moves == 1, future_rewards, -10000), axis=1)\
+                                      .reshape(-1, 1)) * (1 - dones)
 
-        target = self._get_model_outputs(s)
+        # Get the current model's predictions for the current states
+        current_predictions = self._get_model_outputs(states)
 
-        target = (1-a)*target + a*discounted_reward
+        # Update target values based on the actions taken
+        updated_targets = (1 - actions) * current_predictions + actions * discounted_future_rewards
 
-        self._model.train(True)
+        # Set the model to training mode
+        self._model.train()
 
+        # Zero out gradients from previous steps
         self._model.zero_grad()
 
-        reshaped_board = torch.tensor(self._normalize_board(s), requires_grad=True).float().reshape(-1, 2, 10, 10).to(self.device)
-        outputs = self._model(reshaped_board)
+        # Prepare the input states and normalize them for the model
+        input_states = torch.tensor(self._normalize_board(states), requires_grad=True).float().reshape(-1, 2, 10, 10).to(self.device)
+        # Get the model's output predictions for the current states
+        model_outputs = self._model(input_states)
 
-        target_tensor = torch.tensor(target, requires_grad=False).to(torch.float32).to(self.device)
+        # Convert updated target values into a tensor for loss computation
+        target_tensor = torch.tensor(updated_targets, requires_grad=False).to(torch.float32).to(self.device)
 
-        loss = self._criterion(outputs, target_tensor)
+        # Calculate the loss between the model's predictions and the updated targets
+        loss = self._criterion(model_outputs, target_tensor)
+        # Backpropagate the loss through the network
         loss.backward()
+        # Update the model's weights based on the loss gradient
         self._optimizer.step()
 
+        # Detach the loss and convert to numpy for external use
         return loss.detach().cpu().numpy()
 
     def update_target_net(self):
